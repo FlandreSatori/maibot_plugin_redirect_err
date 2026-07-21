@@ -1,0 +1,31 @@
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[match]
+# 出站纯文本（processed_plain_text）包含以下任一子串时触发（默认不区分大小写）。
+keywords = ["error", "not"]
+case_sensitive = false
+# 为 true 时按单词边界匹配
+word_boundary = false
+
+[action]
+# suppress：拦截后不发送
+# redirect：拦截后转发到 [redirect] 配置的目标会话
+mode = "suppress"
+
+[redirect]
+# 目标类型：group | private | stream_id
+target_type = "group"
+# 目标群号（target_type = group）
+group_id = ""
+# 目标私聊用户 ID（target_type = private）
+user_id = ""
+# 目标 stream_id / session_id（target_type = stream_id，MD5 哈希）
+stream_id = ""
+# 解析群/私聊时的平台
+platform = "qq"
+# 重定向时附加的前缀（可为空）
+prefix = "[redirect_err] "
+# 若当前已在目标会话：continue=照常发出，suppress=仍拦截
+when_already_at_target = "continue"

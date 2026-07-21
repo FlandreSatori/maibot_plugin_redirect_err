@@ -1,0 +1,4 @@
+{
+  "plugin.name": "错误输出重定向",
+  "plugin.description": "Bot 出站文本命中 error/not 等关键词时重定向或抑制"
+}
