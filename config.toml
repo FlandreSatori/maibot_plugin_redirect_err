@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.0.0"
+config_version = "1.1.0"
 
 [match]
 # 出站纯文本（processed_plain_text）包含以下任一子串时触发（默认不区分大小写）。
@@ -29,3 +29,7 @@ platform = "qq"
 prefix = "[redirect_err] "
 # 若当前已在目标会话：continue=照常发出，suppress=仍拦截
 when_already_at_target = "continue"
+# 重定向时是否附带触发上下文（时间、群聊/私聊、发送人、原文等）
+include_trigger_context = true
+# 触发消息正文最大字符数（超出截断）
+trigger_content_max_chars = 500
