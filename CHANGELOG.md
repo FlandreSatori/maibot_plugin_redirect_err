@@ -1,5 +1,10 @@
 # 更新日志
 
+## 1.3.1
+
+- ``config.toml`` 加入 ``.gitignore``（本地可保留文件；避免用户改配置与仓库冲突）。
+- 移除未使用的 ``config.get`` 能力声明。
+
 ## 1.3.0
 
 - 沉默策略拆成两项配置：``silence_message_seconds``（只挡该触发消息的 reply）与 ``silence_session_seconds``（挡整会话 reply）；默认消息 120s、会话 0s。

@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.3.0",
+  "version": "1.3.1",
   "name": "错误输出重定向",
   "description": "当 Bot 出站文本包含指定关键词时拦截并重定向/抑制；可分别配置对触发消息与对会话的沉默秒数。",
   "author": {
@@ -31,8 +31,7 @@
     "chat.open_session",
     "message.get_by_id",
     "message.get_recent",
-    "maisaka.context.append",
-    "config.get"
+    "maisaka.context.append"
   ],
   "i18n": {
     "default_locale": "zh-CN",

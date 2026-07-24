@@ -15,15 +15,15 @@
 
 ## 配置
 
- `config.toml`：
+本地 `config.toml`（已加入 `.gitignore`，不随仓库提交；克隆后可参考下方模板自行创建，或由宿主按默认值生成）：
 
 | 段 | 说明 |
 |---|---|
 | `[match].keywords` | 命中子串列表，默认 `error` / `not` |
-| `[match].word_boundary` | `true` 时按单词匹配，避免 `not` 误伤 `note``notice`等 |
+| `[match].word_boundary` | `true` 时按单词匹配，避免 `not` 误伤 `note` / `notice` 等 |
 | `[action].mode` | `suppress` 或 `redirect` |
-| `[action].silence_message_seconds` | 对该触发消息沉默秒数（默认 120） |
-| `[action].silence_session_seconds` | 对该会话沉默秒数（默认 0） |
+| `[action].silence_message_seconds` | 对该触发消息沉默秒数（默认 120；只挡该 `msg_id`） |
+| `[action].silence_session_seconds` | 对该会话沉默秒数（默认 0；挡该会话全部 reply） |
 | `[redirect].target_type` | `group` / `private` / `stream_id` |
 | `[redirect].group_id` / `user_id` / `stream_id` | 对应目标 |
 | `[redirect].prefix` | 转发时前缀，默认 `[redirect_err] ` |
@@ -31,6 +31,39 @@
 | `[redirect].trigger_content_max_chars` | 触发消息正文截断长度 |
 
 重定向目标会话需可达（机器人已进群 / 可私聊）。
+
+### 配置模板示例
+
+```toml
+[plugin]
+enabled = true
+config_version = "1.3.1"
+
+[match]
+# 出站纯文本包含以下任一子串时触发（默认不区分大小写）
+keywords = ["error", "not"]
+case_sensitive = false
+word_boundary = false
+
+[action]
+# suppress：拦截后不发送；redirect：转发到 [redirect] 目标
+mode = "suppress"
+# 对该触发消息沉默秒数：只挡 reply(msg_id=该消息)；0=关闭
+silence_message_seconds = 120
+# 对该会话沉默秒数：挡该会话全部 reply；0=关闭
+silence_session_seconds = 0
+
+[redirect]
+target_type = "group"
+group_id = ""
+user_id = ""
+stream_id = ""
+platform = "qq"
+prefix = "[redirect_err] "
+when_already_at_target = "continue"
+include_trigger_context = true
+trigger_content_max_chars = 500
+```
 
 开启 `include_trigger_context` 后，转发末尾会附加例如：
 
