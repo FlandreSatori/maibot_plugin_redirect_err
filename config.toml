@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.1.0"
+config_version = "1.3.0"
 
 [match]
 # 出站纯文本（processed_plain_text）包含以下任一子串时触发（默认不区分大小写）。
@@ -13,6 +13,10 @@ word_boundary = false
 # suppress：拦截后不发送
 # redirect：拦截后转发到 [redirect] 配置的目标会话
 mode = "suppress"
+# 对该触发消息沉默秒数：只挡 reply(msg_id=该消息)；0=关闭
+silence_message_seconds = 120
+# 对该会话沉默秒数：挡该会话全部 reply；0=关闭
+silence_session_seconds = 0
 
 [redirect]
 # 目标类型：group | private | stream_id

@@ -6,12 +6,19 @@
 - ``suppress``：中止原发送（不输出）；
 - ``redirect``：中止原发送，并将文本转发到配置的群聊 / 私聊 / stream_id；
   转发时可附带触发该条回复的上下文（时间、会话、发送人、原文等）。
+
+拦截后可按配置：
+- 对该触发消息沉默 N 秒（只挡针对该 msg_id 的 reply）；
+- 对该会话沉默 N 秒（挡该会话全部 reply）。
 """
 
 from __future__ import annotations
 
 import contextvars
+import json
 import re
+import threading
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,7 +39,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.1.0", description="配置版本")
+    config_version: str = Field(default="1.3.0", description="配置版本")
 
 
 class MatchConfig(PluginConfigBase):
@@ -63,6 +70,14 @@ class ActionConfig(PluginConfigBase):
     mode: str = Field(
         default="suppress",
         description="命中动作：suppress（不输出）或 redirect（重定向）",
+    )
+    silence_message_seconds: int = Field(
+        default=120,
+        description="对该触发消息沉默秒数：期间剥离针对该 msg_id 的 reply（0=关闭）",
+    )
+    silence_session_seconds: int = Field(
+        default=0,
+        description="对该会话沉默秒数：期间移除整个会话的 reply 工具（0=关闭）",
     )
 
 
@@ -111,22 +126,235 @@ class RedirectErrPlugin(MaiBotPlugin):
     config_model = RedirectErrConfig
 
     async def on_load(self) -> None:
+        self._silence_session_until: Dict[str, float] = {}
+        self._silence_message_until: Dict[str, float] = {}
+        self._suppress_lock = threading.Lock()
         mode = str(self.config.action.mode or "suppress").strip().lower()
         keywords = [str(k).strip() for k in (self.config.match.keywords or []) if str(k).strip()]
         self.ctx.logger.info(
-            "redirect_err 已加载：enabled=%s mode=%s keywords=%s include_context=%s",
+            "redirect_err 已加载：enabled=%s mode=%s keywords=%s silence_message=%ss silence_session=%ss",
             bool(self.config.plugin.enabled),
             mode,
             keywords,
-            bool(self.config.redirect.include_trigger_context),
+            int(self.config.action.silence_message_seconds or 0),
+            int(self.config.action.silence_session_seconds or 0),
         )
 
     async def on_unload(self) -> None:
-        return
+        with self._suppress_lock:
+            self._silence_session_until.clear()
+            self._silence_message_until.clear()
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         del scope, config_data, version
         self.ctx.logger.info("redirect_err 配置已更新")
+
+    # ─── 沉默窗口 ───────────────────────────────────────────────
+
+    @staticmethod
+    def _prune_expired(mapping: Dict[str, float], now: float) -> None:
+        expired = [key for key, until in mapping.items() if float(until or 0) <= now]
+        for key in expired:
+            mapping.pop(key, None)
+
+    def _mark_silence(self, *, stream_id: str, message_id: str) -> Tuple[int, int]:
+        """写入沉默窗口，返回 (message_seconds, session_seconds)。"""
+
+        msg_sec = max(0, int(self.config.action.silence_message_seconds or 0))
+        sess_sec = max(0, int(self.config.action.silence_session_seconds or 0))
+        now = time.time()
+        sid = str(stream_id or "").strip()
+        mid = str(message_id or "").strip()
+
+        with self._suppress_lock:
+            self._prune_expired(self._silence_session_until, now)
+            self._prune_expired(self._silence_message_until, now)
+            if sess_sec > 0 and sid:
+                self._silence_session_until[sid] = now + sess_sec
+            if msg_sec > 0 and mid:
+                self._silence_message_until[mid] = now + msg_sec
+
+        if msg_sec > 0 and mid:
+            self.ctx.logger.info("redirect_err 消息沉默：msg_id=%s %ss", mid, msg_sec)
+        elif msg_sec > 0 and not mid:
+            self.ctx.logger.warning("redirect_err 无法解析触发 msg_id，消息级沉默未生效（可依赖会话沉默）")
+        if sess_sec > 0 and sid:
+            self.ctx.logger.info("redirect_err 会话沉默：stream_id=%s %ss", sid, sess_sec)
+        return msg_sec, sess_sec
+
+    def _session_silenced(self, session_id: str) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        now = time.time()
+        with self._suppress_lock:
+            self._prune_expired(self._silence_session_until, now)
+            return sid in self._silence_session_until
+
+    def _message_silenced(self, message_id: str) -> bool:
+        mid = str(message_id or "").strip()
+        if not mid:
+            return False
+        now = time.time()
+        with self._suppress_lock:
+            self._prune_expired(self._silence_message_until, now)
+            return mid in self._silence_message_until
+
+    def _any_message_silence_active(self) -> bool:
+        now = time.time()
+        with self._suppress_lock:
+            self._prune_expired(self._silence_message_until, now)
+            return bool(self._silence_message_until)
+
+    async def _append_handled_context(
+        self,
+        stream_id: str,
+        *,
+        mode: str,
+        hit: str,
+        message_id: str,
+        message_seconds: int,
+        session_seconds: int,
+    ) -> None:
+        sid = str(stream_id or "").strip()
+        if not sid:
+            return
+        parts = [
+            f"[redirect_err] 本轮出站回复因命中关键词「{hit}」已按策略处理（mode={mode}）。",
+        ]
+        if message_seconds > 0 and message_id:
+            parts.append(f"请勿再对消息 {message_id} 调用 reply（沉默 {message_seconds}s）。")
+        if session_seconds > 0:
+            parts.append(f"本会话暂时不要调用 reply（沉默 {session_seconds}s）。")
+        if message_seconds <= 0 and session_seconds <= 0:
+            parts.append("本条出站已拦截；若需继续可处理其它消息。")
+        else:
+            parts.append("视为相关触发已处理完毕。")
+        note = "".join(parts)
+        segments = [{"type": "text", "data": note}]
+        try:
+            maisaka = getattr(self.ctx, "maisaka", None)
+            context_api = getattr(maisaka, "context", None) if maisaka is not None else None
+            if context_api is not None and hasattr(context_api, "append"):
+                await context_api.append(
+                    stream_id=sid,
+                    segments=segments,
+                    visible_text=note,
+                    source_kind="plugin:maibot_plugin.redirect_err",
+                )
+                return
+            await self.ctx.call_capability(
+                "maisaka.context.append",
+                stream_id=sid,
+                segments=segments,
+                visible_text=note,
+                source_kind="plugin:maibot_plugin.redirect_err",
+            )
+        except Exception as exc:
+            self.ctx.logger.warning("redirect_err 写入 Maisaka 上下文失败: %s", exc)
+
+    @staticmethod
+    def _tool_call_name(tool_call: Any) -> str:
+        if not isinstance(tool_call, dict):
+            return ""
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "").strip().lower()
+        return str(tool_call.get("name") or "").strip().lower()
+
+    @staticmethod
+    def _tool_definition_name(tool_def: Any) -> str:
+        if not isinstance(tool_def, dict):
+            return ""
+        function = tool_def.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "").strip().lower()
+        return str(tool_def.get("name") or "").strip().lower()
+
+    @staticmethod
+    def _reply_tool_msg_id(tool_call: Any) -> str:
+        if not isinstance(tool_call, dict):
+            return ""
+        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        args = function.get("arguments") if isinstance(function, dict) else tool_call.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                return ""
+        if not isinstance(args, dict):
+            return ""
+        return str(args.get("msg_id") or "").strip()
+
+    def _strip_reply_tool_calls(
+        self,
+        tool_calls: Any,
+        *,
+        session_id: str,
+    ) -> Tuple[List[Any], bool]:
+        if not isinstance(tool_calls, list):
+            return [], False
+        session_blocked = self._session_silenced(session_id)
+        kept: List[Any] = []
+        removed = False
+        for item in tool_calls:
+            if self._tool_call_name(item) != "reply":
+                kept.append(item)
+                continue
+            if session_blocked:
+                removed = True
+                continue
+            target_id = self._reply_tool_msg_id(item)
+            if target_id and self._message_silenced(target_id):
+                removed = True
+                continue
+            # 无 msg_id 时：若本会话刚有消息沉默窗口，保守剥离（避免重试漏网）
+            if not target_id and self._any_message_silence_active():
+                removed = True
+                continue
+            kept.append(item)
+        if removed and not kept:
+            kept.append(
+                {
+                    "id": f"redirect_err_wait_{int(time.time() * 1000)}",
+                    "function": {"name": "wait", "arguments": {"seconds": 1}},
+                }
+            )
+        return kept, removed
+
+    def _strip_reply_tool_definitions(self, tool_definitions: Any) -> Tuple[List[Any], bool]:
+        if not isinstance(tool_definitions, list):
+            return [], False
+        kept: List[Any] = []
+        removed = False
+        for item in tool_definitions:
+            if self._tool_definition_name(item) == "reply":
+                removed = True
+                continue
+            kept.append(item)
+        return kept, removed
+
+    def _resolve_trigger_message_id(self, message: Any) -> str:
+        outbound = message if isinstance(message, dict) else {}
+        hint = self._extract_reply_hint(outbound)
+        return str(hint.get("message_id") or "").strip()
+
+    async def _after_intercept(self, stream_id: str, *, mode: str, hit: str, message: Any = None) -> None:
+        """拦截出站后：写入消息/会话沉默窗口，并提示 Maisaka。"""
+
+        message_id = self._resolve_trigger_message_id(message)
+        msg_sec, sess_sec = self._mark_silence(stream_id=stream_id, message_id=message_id)
+        if msg_sec > 0 or sess_sec > 0:
+            await self._append_handled_context(
+                stream_id,
+                mode=mode,
+                hit=hit,
+                message_id=message_id,
+                message_seconds=msg_sec,
+                session_seconds=sess_sec,
+            )
+
+    # ─── 匹配 / 重定向辅助 ──────────────────────────────────────
 
     def _extract_outbound_text(self, message: Any, processed_plain_text: str) -> str:
         text = str(processed_plain_text or "").strip()
@@ -137,8 +365,6 @@ class RedirectErrPlugin(MaiBotPlugin):
         return ""
 
     def _text_matches(self, text: str) -> Optional[str]:
-        """若命中则返回命中的关键词，否则 None。"""
-
         keywords = [str(k).strip() for k in (self.config.match.keywords or []) if str(k).strip()]
         if not text or not keywords:
             return None
@@ -216,7 +442,6 @@ class RedirectErrPlugin(MaiBotPlugin):
         text = str(value).strip()
         if not text:
             return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # ISO / "2026-07-24T08:49:00" → 更易读
         try:
             normalized = text.replace("Z", "+00:00")
             return datetime.fromisoformat(normalized).strftime("%Y-%m-%d %H:%M:%S")
@@ -232,8 +457,6 @@ class RedirectErrPlugin(MaiBotPlugin):
         return normalized[:limit] + "…"
 
     def _extract_reply_hint(self, message: Optional[Dict[str, Any]]) -> Dict[str, str]:
-        """从出站消息的 reply 段 / reply_to 提取触发线索。"""
-
         hint: Dict[str, str] = {
             "message_id": "",
             "content": "",
@@ -274,7 +497,7 @@ class RedirectErrPlugin(MaiBotPlugin):
             break
         return hint
 
-    def _message_user_fields(self, message: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    def _message_user_fields(self, message: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         info = self._as_dict((message or {}).get("message_info"))
         user = self._as_dict(info.get("user_info"))
         return {
@@ -299,7 +522,6 @@ class RedirectErrPlugin(MaiBotPlugin):
                 self.ctx.logger.debug("redirect_err 列举聊天流失败: %s", exc)
                 return {}
 
-        streams: List[Any]
         if isinstance(payload, list):
             streams = payload
         elif isinstance(payload, dict):
@@ -309,9 +531,7 @@ class RedirectErrPlugin(MaiBotPlugin):
             streams = []
 
         for item in streams:
-            if not isinstance(item, dict):
-                continue
-            if self._pick_stream_id(item) == sid:
+            if isinstance(item, dict) and self._pick_stream_id(item) == sid:
                 return item
         return {}
 
@@ -320,8 +540,6 @@ class RedirectErrPlugin(MaiBotPlugin):
         message: Optional[Dict[str, Any]],
         stream: Dict[str, Any],
     ) -> Tuple[str, str, str]:
-        """返回 (会话描述, group_id, user_id)。"""
-
         info = self._as_dict((message or {}).get("message_info"))
         group = self._as_dict(info.get("group_info"))
         user = self._as_dict(info.get("user_info"))
@@ -329,9 +547,7 @@ class RedirectErrPlugin(MaiBotPlugin):
         group_id = str(group.get("group_id") or stream.get("group_id") or "").strip()
         group_name = str(group.get("group_name") or stream.get("group_name") or "").strip()
         peer_user_id = str(stream.get("user_id") or "").strip()
-        peer_nick = str(
-            stream.get("user_nickname") or stream.get("user_cardname") or ""
-        ).strip()
+        peer_nick = str(stream.get("user_nickname") or stream.get("user_cardname") or "").strip()
 
         is_group = bool(group_id) or bool(stream.get("is_group_session"))
         if is_group and group_id:
@@ -340,7 +556,6 @@ class RedirectErrPlugin(MaiBotPlugin):
         if peer_user_id:
             title = f"私聊 {peer_nick}({peer_user_id})" if peer_nick else f"私聊 {peer_user_id}"
             return title, "", peer_user_id
-        # 出站消息的 user_info 是 bot，私聊时用 stream 更准
         bot_or_user = str(user.get("user_id") or "").strip()
         if bot_or_user and not is_group:
             nick = str(user.get("user_nickname") or "").strip()
@@ -379,7 +594,6 @@ class RedirectErrPlugin(MaiBotPlugin):
                 include_binary_data=False,
             )
         except TypeError:
-            # 兼容旧 SDK 参数名差异
             try:
                 payload = await self.ctx.message.get_recent(chat_id=stream_id, limit=20, hours=24)
             except Exception as exc:
@@ -391,10 +605,10 @@ class RedirectErrPlugin(MaiBotPlugin):
 
         for item in self._unwrap_messages(payload):
             fields = self._message_user_fields(item)
-            uid = fields["user_id"]
+            uid = str(fields.get("user_id") or "")
             if bot_user_id and uid == bot_user_id:
                 continue
-            if fields["content"] or fields["message_id"]:
+            if fields.get("content") or fields.get("message_id"):
                 return item
         return None
 
@@ -424,16 +638,15 @@ class RedirectErrPlugin(MaiBotPlugin):
         )
         trigger_fields = self._message_user_fields(trigger_msg)
 
-        sender_id = trigger_fields["user_id"] or hint["user_id"]
+        sender_id = str(trigger_fields.get("user_id") or hint["user_id"] or "")
         sender_name = (
-            trigger_fields["cardname"]
-            or trigger_fields["nickname"]
+            str(trigger_fields.get("cardname") or "")
+            or str(trigger_fields.get("nickname") or "")
             or hint["cardname"]
             or hint["nickname"]
-            or ""
         )
-        trigger_content = trigger_fields["content"] or hint["content"]
-        trigger_id = trigger_fields["message_id"] or hint["message_id"]
+        trigger_content = str(trigger_fields.get("content") or hint["content"] or "")
+        trigger_id = str(trigger_fields.get("message_id") or hint["message_id"] or "")
         trigger_time = self._format_time(
             trigger_fields.get("timestamp") if trigger_fields.get("timestamp") is not None else outbound.get("timestamp")
         )
@@ -457,12 +670,9 @@ class RedirectErrPlugin(MaiBotPlugin):
             else:
                 lines.append(f"发送人: {sender_id}")
         if trigger_id:
-            lines.append(f"ID: {trigger_id}")
+            lines.append(f"触发消息ID: {trigger_id}")
         lines.append(f"触发消息: {self._truncate(trigger_content, max_chars) or '（无文本 / 未能获取）'}")
-        lines.append(f"命中: {hit_keyword}")
-        # bot_reply_text 已在正文中，这里不重复整段，只给长度提示
-        if bot_reply_text:
-            lines.append(f"Bot回复长度: {len(bot_reply_text)} 字")
+        lines.append(f"命中关键词: {hit_keyword}")
         return "\n".join(lines)
 
     async def _resolve_target_stream_id(self) -> str:
@@ -506,6 +716,8 @@ class RedirectErrPlugin(MaiBotPlugin):
         self.ctx.logger.warning("redirect_err 未知 target_type=%r，已忽略", target_type)
         return ""
 
+    # ─── Hooks ──────────────────────────────────────────────────
+
     @HookHandler(
         "send_service.after_build_message",
         name="redirect_err_outbound",
@@ -542,21 +754,25 @@ class RedirectErrPlugin(MaiBotPlugin):
         )
 
         if mode != "redirect":
+            await self._after_intercept(source_stream, mode="suppress", hit=hit, message=message)
             return {"action": "abort"}
 
         try:
             target_stream = await self._resolve_target_stream_id()
         except Exception as exc:
             self.ctx.logger.error("redirect_err 解析目标会话失败: %s", exc, exc_info=True)
+            await self._after_intercept(source_stream, mode="redirect", hit=hit, message=message)
             return {"action": "abort"}
 
         if not target_stream:
             self.ctx.logger.warning("redirect_err 未配置有效重定向目标，已抑制原消息")
+            await self._after_intercept(source_stream, mode="redirect", hit=hit, message=message)
             return {"action": "abort"}
 
         if source_stream and source_stream == target_stream:
             policy = str(self.config.redirect.when_already_at_target or "continue").strip().lower()
             if policy == "suppress":
+                await self._after_intercept(source_stream, mode="redirect", hit=hit, message=message)
                 return {"action": "abort"}
             return {"action": "continue"}
 
@@ -589,7 +805,95 @@ class RedirectErrPlugin(MaiBotPlugin):
         finally:
             _IN_REDIRECT.reset(token)
 
+        await self._after_intercept(source_stream, mode="redirect", hit=hit, message=message)
         return {"action": "abort"}
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="redirect_err_block_reply_tools",
+        description="会话沉默期间从 Planner 工具列表移除 reply",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+    )
+    async def handle_planner_before_request(
+        self,
+        messages: Any = None,
+        tool_definitions: Any = None,
+        selected_history_count: int = 0,
+        built_message_count: int = 0,
+        selection_reason: str = "",
+        session_id: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        if not bool(self.config.plugin.enabled):
+            return {"action": "continue"}
+        # 仅会话级沉默时移除整个 reply 工具；消息级沉默保留工具，在 after_response 按 msg_id 过滤
+        if not self._session_silenced(session_id):
+            return {"action": "continue"}
+
+        filtered, removed = self._strip_reply_tool_definitions(tool_definitions)
+        if not removed:
+            return {"action": "continue"}
+
+        self.ctx.logger.info("redirect_err 会话沉默：已移除 reply 工具 session_id=%s", session_id)
+        return {
+            "action": "continue",
+            "modified_kwargs": {
+                "messages": messages,
+                "tool_definitions": filtered,
+                "selected_history_count": selected_history_count,
+                "built_message_count": built_message_count,
+                "selection_reason": selection_reason,
+                "session_id": session_id,
+            },
+        }
+
+    @HookHandler(
+        "maisaka.planner.after_response",
+        name="redirect_err_strip_reply_calls",
+        description="按消息/会话沉默窗口剥离 Planner 的 reply 调用",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+    )
+    async def handle_planner_after_response(
+        self,
+        response: str = "",
+        tool_calls: Any = None,
+        selected_history_count: int = 0,
+        built_message_count: int = 0,
+        selection_reason: str = "",
+        session_id: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        if not bool(self.config.plugin.enabled):
+            return {"action": "continue"}
+        if not self._session_silenced(session_id) and not self._any_message_silence_active():
+            return {"action": "continue"}
+
+        filtered, removed = self._strip_reply_tool_calls(tool_calls, session_id=session_id)
+        if not removed:
+            return {"action": "continue"}
+
+        self.ctx.logger.info("redirect_err 已剥离受限 reply 调用：session_id=%s", session_id)
+        return {
+            "action": "continue",
+            "modified_kwargs": {
+                "response": response,
+                "tool_calls": filtered,
+                "selected_history_count": selected_history_count,
+                "built_message_count": built_message_count,
+                "selection_reason": selection_reason,
+                "session_id": session_id,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            },
+        }
 
 
 def create_plugin() -> RedirectErrPlugin:

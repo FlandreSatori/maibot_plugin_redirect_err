@@ -22,6 +22,8 @@
 | `[match].keywords` | 命中子串列表，默认 `error` / `not` |
 | `[match].word_boundary` | `true` 时按单词匹配，避免 `not` 误伤 `note``notice`等 |
 | `[action].mode` | `suppress` 或 `redirect` |
+| `[action].silence_message_seconds` | 对该触发消息沉默秒数（默认 120） |
+| `[action].silence_session_seconds` | 对该会话沉默秒数（默认 0） |
 | `[redirect].target_type` | `group` / `private` / `stream_id` |
 | `[redirect].group_id` / `user_id` / `stream_id` | 对应目标 |
 | `[redirect].prefix` | 转发时前缀，默认 `[redirect_err] ` |
@@ -43,10 +45,3 @@ ID: ...
 ```
 
 上下文优先取出站消息的引用（`reply_to` / reply 段），否则回退查询该会话近期非 Bot 消息。
-
-## 行为说明
-
-- 挂载 Hook：`send_service.after_build_message`（消息构建完成后、真正发出前）
-- 命中关键词后对**原目标**返回 `abort`，避免原群看到错误文案
-- 转发使用 `ctx.send.text`，并用 ContextVar 防止递归再次拦截
-- 若当前已在目标会话：默认 `when_already_at_target = continue`（错误频道照常显示）
