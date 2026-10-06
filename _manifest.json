@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.3.1",
+  "version": "1.3.2",
   "name": "错误输出重定向",
   "description": "当 Bot 出站文本包含指定关键词时拦截并重定向/抑制；可分别配置对触发消息与对会话的沉默秒数。",
   "author": {
@@ -25,7 +25,6 @@
   "dependencies": [],
   "capabilities": [
     "send.text",
-    "chat.get_all_streams",
     "chat.get_stream_by_group_id",
     "chat.get_stream_by_user_id",
     "chat.open_session",

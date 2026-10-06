@@ -129,6 +129,10 @@ class RedirectErrPlugin(MaiBotPlugin):
         self._silence_session_until: Dict[str, float] = {}
         self._silence_message_until: Dict[str, float] = {}
         self._suppress_lock = threading.Lock()
+        self._target_stream_resolved: Optional[str] = None
+        self._match_keywords: List[str] = []
+        self._match_needles: List[Tuple[str, Optional[re.Pattern[str]]]] = []
+        self._rebuild_match_cache()
         mode = str(self.config.action.mode or "suppress").strip().lower()
         keywords = [str(k).strip() for k in (self.config.match.keywords or []) if str(k).strip()]
         self.ctx.logger.info(
@@ -147,6 +151,8 @@ class RedirectErrPlugin(MaiBotPlugin):
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         del scope, config_data, version
+        self._target_stream_resolved = None
+        self._rebuild_match_cache()
         self.ctx.logger.info("redirect_err 配置已更新")
 
     # ─── 沉默窗口 ───────────────────────────────────────────────
@@ -364,23 +370,34 @@ class RedirectErrPlugin(MaiBotPlugin):
             return str(message.get("processed_plain_text") or "").strip()
         return ""
 
-    def _text_matches(self, text: str) -> Optional[str]:
+    def _rebuild_match_cache(self) -> None:
+        """预构建关键词匹配所需数据（列表 + 边界正则），配置更新时重建。"""
+
         keywords = [str(k).strip() for k in (self.config.match.keywords or []) if str(k).strip()]
-        if not text or not keywords:
+        case_sensitive = bool(self.config.match.case_sensitive)
+        word_boundary = bool(self.config.match.word_boundary)
+        needles: List[Tuple[str, Optional[re.Pattern[str]]]] = []
+        for raw in keywords:
+            needle = raw if case_sensitive else raw.lower()
+            compiled: Optional[re.Pattern[str]] = None
+            if word_boundary:
+                flags = 0 if case_sensitive else re.IGNORECASE
+                compiled = re.compile(rf"(?<!\w){re.escape(raw)}(?!\w)", flags)
+            needles.append((needle, compiled))
+        self._match_keywords = keywords
+        self._match_needles = needles
+
+    def _text_matches(self, text: str) -> Optional[str]:
+        if not text or not self._match_keywords:
             return None
 
         case_sensitive = bool(self.config.match.case_sensitive)
         word_boundary = bool(self.config.match.word_boundary)
         haystack = text if case_sensitive else text.lower()
 
-        for raw in keywords:
-            needle = raw if case_sensitive else raw.lower()
-            if not needle:
-                continue
+        for raw, (needle, compiled) in zip(self._match_keywords, self._match_needles):
             if word_boundary:
-                flags = 0 if case_sensitive else re.IGNORECASE
-                pattern = rf"(?<!\w){re.escape(raw)}(?!\w)"
-                if re.search(pattern, text, flags=flags):
+                if compiled is not None and compiled.search(text):
                     return raw
             elif needle in haystack:
                 return raw
@@ -509,32 +526,6 @@ class RedirectErrPlugin(MaiBotPlugin):
             "timestamp": (message or {}).get("timestamp"),
         }
 
-    async def _lookup_stream(self, stream_id: str, platform: str = "qq") -> Dict[str, Any]:
-        sid = str(stream_id or "").strip()
-        if not sid:
-            return {}
-        try:
-            payload = await self.ctx.chat.get_all_streams(platform=platform or "qq")
-        except Exception:
-            try:
-                payload = await self.ctx.chat.get_all_streams(platform="all_platforms")
-            except Exception as exc:
-                self.ctx.logger.debug("redirect_err 列举聊天流失败: %s", exc)
-                return {}
-
-        if isinstance(payload, list):
-            streams = payload
-        elif isinstance(payload, dict):
-            nested = payload.get("streams")
-            streams = nested if isinstance(nested, list) else []
-        else:
-            streams = []
-
-        for item in streams:
-            if isinstance(item, dict) and self._pick_stream_id(item) == sid:
-                return item
-        return {}
-
     def _session_label_from_message_and_stream(
         self,
         message: Optional[Dict[str, Any]],
@@ -622,8 +613,8 @@ class RedirectErrPlugin(MaiBotPlugin):
     ) -> str:
         max_chars = int(self.config.redirect.trigger_content_max_chars or 500)
         outbound = message if isinstance(message, dict) else {}
-        platform = str(outbound.get("platform") or self.config.redirect.platform or "qq").strip() or "qq"
-        stream = await self._lookup_stream(stream_id, platform=platform)
+        # 会话标签优先从出站消息的 message_info 组装；不再全量拉取聊天流列表
+        stream: Dict[str, Any] = {}
         session_label, group_id, private_user_id = self._session_label_from_message_and_stream(outbound, stream)
 
         outbound_info = self._as_dict(outbound.get("message_info"))
@@ -676,6 +667,15 @@ class RedirectErrPlugin(MaiBotPlugin):
         return "\n".join(lines)
 
     async def _resolve_target_stream_id(self) -> str:
+        # 成功解析结果按配置缓存，避免每次命中都查询/打开会话；配置更新时失效
+        if self._target_stream_resolved is not None:
+            return self._target_stream_resolved
+        resolved = await self._resolve_target_stream_id_uncached()
+        if resolved:
+            self._target_stream_resolved = resolved
+        return resolved
+
+    async def _resolve_target_stream_id_uncached(self) -> str:
         cfg = self.config.redirect
         target_type = str(cfg.target_type or "group").strip().lower()
         platform = str(cfg.platform or "qq").strip() or "qq"
