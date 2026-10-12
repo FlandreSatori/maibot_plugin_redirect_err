@@ -15,8 +15,6 @@
 
 ## 配置
 
-本地 `config.toml`（已加入 `.gitignore`，不随仓库提交；克隆后可参考下方模板自行创建，或由宿主按默认值生成）：
-
 | 段 | 说明 |
 |---|---|
 | `[match].keywords` | 命中子串列表，默认 `error` / `not` |
@@ -78,3 +76,5 @@ ID: ...
 ```
 
 上下文优先取出站消息的引用（`reply_to` / reply 段），否则回退查询该会话近期非 Bot 消息。
+
+> 兼容性：消息级沉默（`silence_message_seconds`）通过 `maisaka.planner.after_response` 过滤 Planner 的 reply 调用实现，依赖 MaiBot 的 Context Item 协议（宿主传入 `output_items`），需较新版本 MaiBot。会话级沉默（`silence_session_seconds`）通过 `before_request` 移除 reply 工具实现，不受影响。

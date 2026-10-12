@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import contextvars
-import json
 import re
 import threading
 import time
@@ -260,15 +259,6 @@ class RedirectErrPlugin(MaiBotPlugin):
             self.ctx.logger.warning("redirect_err 写入 Maisaka 上下文失败: %s", exc)
 
     @staticmethod
-    def _tool_call_name(tool_call: Any) -> str:
-        if not isinstance(tool_call, dict):
-            return ""
-        function = tool_call.get("function")
-        if isinstance(function, dict):
-            return str(function.get("name") or "").strip().lower()
-        return str(tool_call.get("name") or "").strip().lower()
-
-    @staticmethod
     def _tool_definition_name(tool_def: Any) -> str:
         if not isinstance(tool_def, dict):
             return ""
@@ -277,56 +267,66 @@ class RedirectErrPlugin(MaiBotPlugin):
             return str(function.get("name") or "").strip().lower()
         return str(tool_def.get("name") or "").strip().lower()
 
-    @staticmethod
-    def _reply_tool_msg_id(tool_call: Any) -> str:
-        if not isinstance(tool_call, dict):
-            return ""
-        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
-        args = function.get("arguments") if isinstance(function, dict) else tool_call.get("arguments")
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except Exception:
-                return ""
-        if not isinstance(args, dict):
-            return ""
-        return str(args.get("msg_id") or "").strip()
-
-    def _strip_reply_tool_calls(
+    def _strip_reply_function_calls(
         self,
-        tool_calls: Any,
+        output_items: Any,
         *,
         session_id: str,
     ) -> Tuple[List[Any], bool]:
-        if not isinstance(tool_calls, list):
+        """从序列化 output_items（Context Item 协议）中剥离受限的 reply 调用。
+
+        仅移除 ``item_type == "FunctionCallItem"`` 且 ``tool_call.func_name == "reply"``
+        的 Item；其余 Item 原样保留。全部调用被剥离时注入一条 wait 调用（复用被移除
+        Item 的 meta，保证 logical_turn_id 合法），避免 Planner 空响应退出。
+        """
+
+        if not isinstance(output_items, list):
             return [], False
         session_blocked = self._session_silenced(session_id)
         kept: List[Any] = []
-        removed = False
-        for item in tool_calls:
-            if self._tool_call_name(item) != "reply":
+        removed_metas: List[Dict[str, Any]] = []
+        for item in output_items:
+            if not isinstance(item, dict) or item.get("item_type") != "FunctionCallItem":
+                kept.append(item)
+                continue
+            tool_call = item.get("tool_call") if isinstance(item.get("tool_call"), dict) else {}
+            name = str(tool_call.get("func_name") or "").strip().lower()
+            if name != "reply":
                 kept.append(item)
                 continue
             if session_blocked:
-                removed = True
+                removed_metas.append(item.get("meta") if isinstance(item.get("meta"), dict) else {})
                 continue
-            target_id = self._reply_tool_msg_id(item)
+            args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
+            target_id = str(args.get("msg_id") or "").strip()
             if target_id and self._message_silenced(target_id):
-                removed = True
+                removed_metas.append(item.get("meta") if isinstance(item.get("meta"), dict) else {})
                 continue
             # 无 msg_id 时：若本会话刚有消息沉默窗口，保守剥离（避免重试漏网）
             if not target_id and self._any_message_silence_active():
-                removed = True
+                removed_metas.append(item.get("meta") if isinstance(item.get("meta"), dict) else {})
                 continue
             kept.append(item)
-        if removed and not kept:
+        if not removed_metas:
+            return kept, False
+        has_call = any(
+            isinstance(item, dict) and item.get("item_type") == "FunctionCallItem" for item in kept
+        )
+        if not has_call:
+            meta = removed_metas[0] if removed_metas and removed_metas[0] else {}
             kept.append(
                 {
-                    "id": f"redirect_err_wait_{int(time.time() * 1000)}",
-                    "function": {"name": "wait", "arguments": {"seconds": 1}},
+                    "item_type": "FunctionCallItem",
+                    "meta": dict(meta),
+                    "tool_call": {
+                        "call_id": f"redirect_err_wait_{int(time.time() * 1000)}",
+                        "func_name": "wait",
+                        "args": {"seconds": 1},
+                        "extra_content": None,
+                    },
                 }
             )
-        return kept, removed
+        return kept, True
 
     def _strip_reply_tool_definitions(self, tool_definitions: Any) -> Tuple[List[Any], bool]:
         if not isinstance(tool_definitions, list):
@@ -577,19 +577,7 @@ class RedirectErrPlugin(MaiBotPlugin):
         if not stream_id:
             return None
         try:
-            payload = await self.ctx.message.get_recent(
-                chat_id=stream_id,
-                limit=20,
-                hours=24,
-                filter_mai=True,
-                include_binary_data=False,
-            )
-        except TypeError:
-            try:
-                payload = await self.ctx.message.get_recent(chat_id=stream_id, limit=20, hours=24)
-            except Exception as exc:
-                self.ctx.logger.debug("redirect_err get_recent 失败: %s", exc)
-                return None
+            payload = await self.ctx.message.get_recent(chat_id=stream_id, limit=20)
         except Exception as exc:
             self.ctx.logger.debug("redirect_err get_recent 失败: %s", exc)
             return None
@@ -817,7 +805,8 @@ class RedirectErrPlugin(MaiBotPlugin):
     )
     async def handle_planner_before_request(
         self,
-        messages: Any = None,
+        items: Any = None,
+        item_schema_version: Any = None,
         tool_definitions: Any = None,
         selected_history_count: int = 0,
         built_message_count: int = 0,
@@ -840,7 +829,8 @@ class RedirectErrPlugin(MaiBotPlugin):
         return {
             "action": "continue",
             "modified_kwargs": {
-                "messages": messages,
+                "items": items,
+                "item_schema_version": item_schema_version,
                 "tool_definitions": filtered,
                 "selected_history_count": selected_history_count,
                 "built_message_count": built_message_count,
@@ -858,8 +848,8 @@ class RedirectErrPlugin(MaiBotPlugin):
     )
     async def handle_planner_after_response(
         self,
-        response: str = "",
-        tool_calls: Any = None,
+        output_items: Any = None,
+        item_schema_version: Any = None,
         selected_history_count: int = 0,
         built_message_count: int = 0,
         selection_reason: str = "",
@@ -872,10 +862,12 @@ class RedirectErrPlugin(MaiBotPlugin):
         del kwargs
         if not bool(self.config.plugin.enabled):
             return {"action": "continue"}
+        if not isinstance(output_items, list):
+            return {"action": "continue"}
         if not self._session_silenced(session_id) and not self._any_message_silence_active():
             return {"action": "continue"}
 
-        filtered, removed = self._strip_reply_tool_calls(tool_calls, session_id=session_id)
+        filtered, removed = self._strip_reply_function_calls(output_items, session_id=session_id)
         if not removed:
             return {"action": "continue"}
 
@@ -883,8 +875,8 @@ class RedirectErrPlugin(MaiBotPlugin):
         return {
             "action": "continue",
             "modified_kwargs": {
-                "response": response,
-                "tool_calls": filtered,
+                "output_items": filtered,
+                "item_schema_version": item_schema_version,
                 "selected_history_count": selected_history_count,
                 "built_message_count": built_message_count,
                 "selection_reason": selection_reason,
